@@ -441,14 +441,21 @@ Respond directly and helpfully. No emojis."""
                 if docker_cmd:
                     console.print(f"\n[cyan]Comando generado:[/cyan] {docker_cmd}")
                     
-                    # Check security
+                    # Check security (gate any non-LOW risk: MEDIUM, HIGH, CRITICAL)
                     risk, reason = security.classify_risk(docker_cmd)
-                    
-                    if risk in [security.RISK_HIGH, security.RISK_CRITICAL]:
+            
+                    if risk != security.RISK_LOW:
                         explanation = security.explain_command(docker_cmd)
-                        console.print(f"[yellow]⚠ {risk}:[/yellow] {explanation}")
-                        console.print(f"\n[cyan]¿Ejecutar? (s/n):[/cyan] ", end="")
-                        if input().strip().lower() not in ['s', 'si', 'y']:
+                        console.print(f"\n[bold yellow]⚠ Comando {risk}:[/bold yellow] {explanation}")
+                        if reason:
+                            console.print(f"[yellow]Riesgo:[/yellow] {reason}")
+                        if risk == security.RISK_CRITICAL:
+                            console.print("\n[bold red]Escribir 'CONFIRMO' para ejecutar:[/bold red] ", end="")
+                            confirmed = input().strip() == "CONFIRMO"
+                        else:
+                            console.print("\n[cyan]¿Ejecutar? (s/n):[/cyan] ", end="")
+                            confirmed = input().strip().lower() in ['s', 'si', 'y', 'yes']
+                        if not confirmed:
                             console.print("[green]Cancelado.[/green]")
                             security.audit_log(docker_cmd, risk, False, False)
                             continue
@@ -662,10 +669,10 @@ Respond directly and helpfully. No emojis."""
                                 console.print(f"[red]Error: {e}[/red]")
                             continue
                         
-                        # Security Check
+                        # Security Check (gate any non-LOW risk: MEDIUM, HIGH, CRITICAL)
                         risk, reason = security.classify_risk(cmd)
                         
-                        if risk in [security.RISK_HIGH, security.RISK_CRITICAL]:
+                        if risk != security.RISK_LOW:
                             # Show command explanation
                             explanation = security.explain_command(cmd)
                             console.print(f"\n[bold yellow]⚠ Comando {risk}[/bold yellow]")
@@ -681,7 +688,7 @@ Respond directly and helpfully. No emojis."""
                                     continue
                             else:
                                 console.print(f"\n[cyan]¿Ejecutar? (s/n):[/cyan] ", end="")
-                                if input().strip().lower() not in ['s', 'si', 'y']:
+                                if input().strip().lower() not in ['s', 'si', 'y', 'yes']:
                                     console.print("[green]Comando cancelado.[/green]")
                                     security.audit_log(cmd, risk, False, False)
                                     continue
@@ -744,10 +751,10 @@ Respond directly and helpfully. No emojis."""
                     
                     console.print(f"[dim]📁 {current_cwd}[/dim]")
                     
-                    # Security Check
+                    # Security Check (gate any non-LOW risk: MEDIUM, HIGH, CRITICAL)
                     risk, reason = security.classify_risk(command)
                     
-                    if risk in [security.RISK_HIGH, security.RISK_CRITICAL]:
+                    if risk != security.RISK_LOW:
                         explanation = security.explain_command(command)
                         console.print(f"\n[bold yellow]⚠ Comando {risk}[/bold yellow]")
                         console.print(f"[cyan]Acción:[/cyan] {explanation}")
@@ -762,7 +769,7 @@ Respond directly and helpfully. No emojis."""
                                 continue
                         else:
                             console.print(f"\n[cyan]¿Ejecutar? (s/n):[/cyan] ", end="")
-                            if input().strip().lower() not in ['s', 'si', 'y']:
+                            if input().strip().lower() not in ['s', 'si', 'y', 'yes']:
                                 console.print("[green]Comando cancelado.[/green]")
                                 security.audit_log(command, risk, False, False)
                                 continue

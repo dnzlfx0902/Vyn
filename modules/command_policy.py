@@ -76,6 +76,24 @@ _READONLY_SUBCOMMANDS = {
     "ip": frozenset({"addr", "a", "link", "route", "r", "neigh"}),
 }
 
+# Acciones mutantes en binarios cuyos subcomandos base admiten lecturas y escrituras.
+_MUTATING_SUBCOMMAND_ARGS = {
+    ("git", "branch"): frozenset({
+        "-d", "-D", "--delete", "-m", "-M", "--move", "-c", "-C", "--copy",
+        "--set-upstream-to", "-u", "--unset-upstream", "--edit-description",
+    }),
+    ("git", "tag"): frozenset({"-a", "-s", "-u", "-d", "-f", "--delete", "--force"}),
+    ("git", "remote"): frozenset({
+        "add", "remove", "rm", "rename", "set-url", "set-head", "set-branches", "prune",
+    }),
+    ("ip", "addr"): frozenset({"add", "del", "delete", "change", "replace", "flush"}),
+    ("ip", "a"): frozenset({"add", "del", "delete", "change", "replace", "flush"}),
+    ("ip", "link"): frozenset({"add", "del", "delete", "set", "change", "replace"}),
+    ("ip", "route"): frozenset({"add", "del", "delete", "change", "replace", "flush", "append"}),
+    ("ip", "r"): frozenset({"add", "del", "delete", "change", "replace", "flush", "append"}),
+    ("ip", "neigh"): frozenset({"add", "del", "delete", "change", "replace", "flush"}),
+}
+
 # Flags de `find` que ejecutan comandos o escriben archivos.
 _FIND_EXEC_FLAGS = frozenset({
     "-exec", "-execdir", "-ok", "-okdir", "-delete",
@@ -188,6 +206,27 @@ class CommandPolicy:
             sub = args[0] if args else ""
             if sub not in readonly:
                 return (cls.RISK_MEDIUM, "Subcomando '{} {}' no es de solo lectura".format(base, sub))
+            sub_args = args[1:]
+            mutating_flags = _MUTATING_SUBCOMMAND_ARGS.get((base, sub))
+            if mutating_flags and any(a in mutating_flags for a in sub_args):
+                return (
+                    cls.RISK_MEDIUM,
+                    "Argumentos mutantes en '{} {}': requiere confirmacion".format(base, sub),
+                )
+            if (base, sub) == ("git", "branch") and any(not a.startswith("-") for a in sub_args):
+                # `git branch <nombre>` sin flags de listado crea una rama.
+                if not any(a in ("-l", "--list", "-a", "--all", "-r", "--remotes", "--contains", "--no-contains", "--merged", "--no-merged") for a in sub_args):
+                    return (
+                        cls.RISK_MEDIUM,
+                        "Creacion de rama en 'git branch': requiere confirmacion",
+                    )
+            if (base, sub) == ("git", "tag") and any(not a.startswith("-") for a in sub_args):
+                # `git tag <nombre>` sin flags crea un tag ligero; solo `-l`/`--list` es lectura.
+                if not any(a in ("-l", "--list", "-v", "--verify") for a in sub_args):
+                    return (
+                        cls.RISK_MEDIUM,
+                        "Creacion de tag en 'git tag': requiere confirmacion",
+                    )
 
         return (cls.RISK_LOW, None)
 

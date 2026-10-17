@@ -16,6 +16,17 @@ class DockerHelper:
     Designed for homelab users who want to manage containers conversationally.
     """
     
+    # Valid Docker container/service identifier (prevents invalid names and shell injection)
+    VALID_TARGET_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$')
+    
+    # Reserved command words that should not be treated as a container/service name
+    RESERVED_TARGETS = frozenset({
+        'de', 'del', 'el', 'la', 'los', 'las', 'un', 'una', 'en', 'puerto', 'port',
+        'contenedor', 'contenedores', 'container', 'containers', 'servicio', 'servicios',
+        'docker', 'status', 'estado', 'estados', 'stats', 'recursos', 'imagenes', 'images',
+        'logs', 'registros',
+    })
+    
     # Common service templates for quick deployment
     SERVICE_TEMPLATES = {
         'nextcloud': {
@@ -95,39 +106,35 @@ class DockerHelper:
     # Natural language patterns for Docker operations
     NL_PATTERNS = {
         'run': [
-            r'(?:levanta|inicia|crea|lanza|ejecuta|run|start|create)\s+(?:un\s+)?(?:contenedor\s+(?:de\s+)?)?(\w+)',
-            r'(?:deploy|despliega)\s+(\w+)',
+            r'\b(?:levanta|inicia|crea|lanza|ejecuta|run|start|create)\s+(?:un\s+|el\s+)?(?:contenedor\s+(?:de\s+)?|servicio\s+(?:de\s+)?)?([a-zA-Z0-9][a-zA-Z0-9_.-]*)',
+            r'\b(?:deploy|despliega)\s+(?:el\s+)?(?:servicio\s+|contenedor\s+)?([a-zA-Z0-9][a-zA-Z0-9_.-]*)',
         ],
         'stop': [
-            r'(?:para|detén|deten|stop)\s+(?:el\s+)?(?:contenedor\s+)?(\w+)',
+            r'\b(?:para|detén|deten|stop)\s+(?:el\s+)?(?:contenedor\s+|servicio\s+)?([a-zA-Z0-9][a-zA-Z0-9_.-]*)',
         ],
         'restart': [
-            r'(?:reinicia|restart)\s+(?:el\s+)?(?:contenedor\s+)?(\w+)',
+            r'\b(?:reinicia|restart)\s+(?:el\s+)?(?:contenedor\s+|servicio\s+)?([a-zA-Z0-9][a-zA-Z0-9_.-]*)',
         ],
         'remove': [
-            r'(?:elimina|borra|remove|rm)\s+(?:el\s+)?(?:contenedor\s+)?(\w+)',
+            r'\b(?:elimina|borra|remove|rm)\s+(?:el\s+)?(?:contenedor\s+|servicio\s+)?([a-zA-Z0-9][a-zA-Z0-9_.-]*)',
         ],
         'logs': [
-            r'(?:logs?|registros?)\s+(?:de\s+|del\s+)?(?:contenedor\s+)?(\w+)',
-            r'(?:muestra|ver)\s+(?:los\s+)?logs?\s+(?:de\s+)?(\w+)',
+            r'\b(?:logs?|registros?)\s+(?:de\s+|del\s+)?(?:contenedor\s+|servicio\s+)?([a-zA-Z0-9][a-zA-Z0-9_.-]*)',
+            r'\b(?:muestra|ver)\s+(?:los\s+)?logs?\s+(?:de\s+|del\s+)?(?:contenedor\s+|servicio\s+)?([a-zA-Z0-9][a-zA-Z0-9_.-]*)',
         ],
         'status': [
-            r'(?:status|estado|estados)\s+(?:de\s+)?(?:los\s+)?(?:contenedores?)?',
-            r'(?:muestra|lista|ver)\s+(?:los\s+)?contenedores?',
-            r'docker\s+ps',
+            r'\b(?:status|estado|estados)\b\s*(?:de\s+)?(?:los\s+)?(?:contenedores?)?',
+            r'\b(?:muestra|lista|ver)\s+(?:los\s+)?contenedores?\b',
+            r'\bdocker\s+ps\b',
         ],
         'images': [
-            r'(?:imagenes|images)\s*(?:de\s+docker)?',
-            r'(?:lista|muestra)\s+(?:las\s+)?imagenes',
+            r'\b(?:imagenes|imágenes|images)\b\s*(?:de\s+docker)?',
+            r'\b(?:lista|muestra)\s+(?:las\s+)?(?:imagenes|imágenes)\b',
         ],
         'stats': [
-            r'(?:recursos|resources|stats)\s+(?:de\s+)?(?:los\s+)?(?:contenedores?)?',
-            r'(?:consumo|uso)\s+(?:de\s+)?(?:recursos|memoria|cpu)',
+            r'\b(?:recursos|resources|stats)\b\s*(?:de\s+)?(?:los\s+)?(?:contenedores?)?',
+            r'\b(?:consumo|uso)\s+(?:de\s+)?(?:recursos|memoria|cpu)\b',
         ],
-        'port': [
-            r'(?:en\s+)?(?:el\s+)?puerto\s+(\d+)',
-            r'port\s+(\d+)',
-        ]
     }
     
     def __init__(self, console=None):
@@ -149,6 +156,24 @@ class DockerHelper:
         else:
             print(message)
     
+    @classmethod
+    def is_valid_target(cls, target: Optional[str]) -> bool:
+        """Return True if target is a safe, non-reserved container/service identifier."""
+        if not target:
+            return False
+        lowered = target.lower()
+        if lowered in cls.RESERVED_TARGETS:
+            return False
+        return bool(cls.VALID_TARGET_RE.match(target))
+
+    @staticmethod
+    def is_valid_port(port: Optional[str]) -> bool:
+        """Return True if port is a valid TCP/UDP port in range 1..65535."""
+        if port is None or not str(port).isdigit():
+            return False
+        port_num = int(port)
+        return 1 <= port_num <= 65535
+
     def parse_natural_language(self, query: str) -> Tuple[Optional[str], Optional[str], Dict]:
         """
         Parse natural language query into Docker operation.
@@ -159,7 +184,13 @@ class DockerHelper:
         Returns:
             Tuple of (operation, target, options)
         """
-        query_lower = query.lower().strip()
+        query_lower = (query or "").lower().strip()
+        if not query_lower:
+            return (None, None, {})
+        
+        # Reject queries containing shell metacharacters or control characters
+        if any(ch in query_lower for ch in (";", "|", "&", "$", "`", ">", "<", "\n", "\r")):
+            return (None, None, {})
         
         # Try to match each operation pattern
         for operation, patterns in self.NL_PATTERNS.items():
@@ -167,12 +198,17 @@ class DockerHelper:
                 match = re.search(pattern, query_lower)
                 if match:
                     target = match.group(1) if match.groups() else None
+                    if target is not None and not self.is_valid_target(target):
+                        continue
                     
                     # Extract port if mentioned
                     options = {}
-                    port_match = re.search(r'(?:puerto|port)\s+(\d+)', query_lower)
+                    port_match = re.search(r'\b(?:puerto|port)\s+(\d+)\b', query_lower)
                     if port_match:
-                        options['port'] = port_match.group(1)
+                        port_str = port_match.group(1)
+                        if not self.is_valid_port(port_str):
+                            return (None, None, {})
+                        options['port'] = port_str
                     
                     return (operation, target, options)
         
@@ -202,7 +238,9 @@ class DockerHelper:
         if operation == 'stats':
             return 'docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"'
         
-        if not target:
+        if not target or not self.is_valid_target(target):
+            return None
+        if 'port' in options and not self.is_valid_port(options['port']):
             return None
         
         if operation == 'run':

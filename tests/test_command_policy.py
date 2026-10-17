@@ -126,6 +126,53 @@ def test_dangerous_subcommand_of_safe_binary_is_not_low():
     assert _risk("git push --force") != CommandPolicy.RISK_LOW
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git branch -D feature",
+        "git branch -d feature",
+        "git branch -m old new",
+        "git branch nueva-rama",
+        "git tag v1.0.0",
+        "git tag -d v1.0.0",
+        "git remote remove origin",
+        "git remote set-url origin https://evil.example/repo.git",
+        "ip addr add 10.0.0.2/24 dev eth0",
+        "ip addr flush dev eth0",
+        "ip link set eth0 down",
+        "ip route del default",
+        "ip neigh flush all",
+    ],
+)
+def test_mutating_flags_on_dual_use_subcommands_are_not_low(command):
+    """Subcomandos mixtos (git branch/tag/remote, ip addr/link/route) solo son LOW en lectura."""
+    risk, reason = CommandPolicy.classify(command)
+    assert risk == CommandPolicy.RISK_MEDIUM
+    assert CommandPolicy.is_command_safe(command) is False
+    assert reason
+    assert _security_layer().classify_risk(command)[0] != SecurityLayer.RISK_LOW
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git branch",
+        "git branch -a",
+        "git branch --list",
+        "git tag",
+        "git tag -l",
+        "git remote",
+        "git remote -v",
+        "ip addr show",
+        "ip link show",
+        "ip route show",
+    ],
+)
+def test_readonly_flags_on_dual_use_subcommands_stay_low(command):
+    assert _risk(command) == CommandPolicy.RISK_LOW
+    assert CommandPolicy.is_command_safe(command) is True
+
+
 def test_empty_command_is_low():
     assert _risk("") == CommandPolicy.RISK_LOW
     assert _risk("   ") == CommandPolicy.RISK_LOW
