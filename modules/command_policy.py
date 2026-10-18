@@ -19,12 +19,34 @@ shell (``;``, ``|``, ``&``, ``$(...)``, backticks, redirecciones, saltos de
 linea), se degrada deliberadamente la clasificacion: el comando jamas sera
 LOW y por lo tanto siempre exigira confirmacion. El modo de fallo es
 *fail-closed*: lo desconocido no se auto-ejecuta.
+
+Segunda capa (2026-10-18): **vectores de ejecucion y mutacion a nivel de
+argumento**. Una allowlist por binario no basta: hay binarios de lectura cuyos
+*argumentos* lanzan subprocesos o mutan el sistema aunque la linea de comandos
+sea un unico comando simple. Todos estos casos se clasificaban LOW (es decir,
+se auto-ejecutaban en el servidor remoto **sin confirmacion**):
+
+    command rm -rf /                      -> ejecuta rm                 (bypass total)
+    command shutdown -h now               -> apaga la maquina
+    awk 'BEGIN{system("id")}'             -> ejecucion arbitraria
+    sed -n '1e whoami' f                  -> comando 'e' de GNU sed
+    sed 's/a/b/e' f                       -> flag 'e' de s///
+    sort --compress-program=/bin/sh f     -> ejecuta el programa indicado
+    man -P "sh -c id" ls                  -> pager arbitrario
+    sed -f script.sed f / awk -f p.awk f  -> programa no inspeccionable
+    fuser -k f / ss -K                   -> mata procesos/sockets
+    date -s / hostname NAME / ifconfig eth0 down / dmesg -c -> mutan el sistema
+
+Ademas, los binarios invocados por ruta solo se aceptan desde directorios de
+sistema confiables (``/bin``, ``/usr/bin``, ...); ``./ls`` o ``/tmp/ls``
+quedan fuera para que un binario homonimo del atacante no herede la allowlist.
 """
 
 from __future__ import annotations
 
+import re
 import shlex
-from typing import List, Optional, Set, Tuple
+from typing import List, Optional, Sequence, Set, Tuple
 
 __all__ = ["CommandPolicy"]
 
@@ -44,7 +66,10 @@ SAFE_BINARIES = frozenset({
     "ls", "cat", "head", "tail", "pwd", "whoami", "hostname", "uname", "id",
     "date", "uptime", "free", "df", "du", "ps", "top", "htop", "w", "who",
     "echo", "printf", "wc", "sort", "uniq", "cut", "tr", "stat", "file",
-    "which", "whereis", "type", "command", "man", "help",
+    # OJO: 'command' NO esta aqui. Es un builtin de shell que ejecuta el
+    # comando que le sigue ('command rm -rf /'), por lo que pertenece a
+    # _EXEC_WRAPPERS: sin este detalle la allowlist se saltaba por completo.
+    "which", "whereis", "type", "man", "help",
     "netstat", "ip", "ifconfig", "ping", "ss", "lsof", "fuser",
     "journalctl", "dmesg",
     "git", "docker", "docker-compose", "podman", "systemctl", "tmux",
@@ -53,7 +78,13 @@ SAFE_BINARIES = frozenset({
 
 # Envoltorios que ejecutan OTRO comando: la allowlist no aplica al envoltorio.
 _PRIVILEGE_WRAPPERS = frozenset({"sudo", "doas", "su", "pkexec"})
-_EXEC_WRAPPERS = frozenset({"xargs", "env", "nice", "ionice", "timeout", "watch", "strace"})
+_EXEC_WRAPPERS = frozenset({
+    "xargs", "env", "nice", "ionice", "timeout", "watch", "strace",
+    # Builtins de shell y lanzadores que ejecutan el resto de la linea.
+    "command", "eval", "exec", "builtin", "time", "nohup", "setsid",
+    "stdbuf", "script", "chroot", "unshare", "nsenter", "systemd-run",
+    "parallel", "runuser", "sg", "firejail", "busybox", "toybox",
+})
 
 # Subcomandos de solo lectura por binario (cualquier otro subcomando -> MEDIUM).
 _READONLY_SUBCOMMANDS = {
@@ -97,11 +128,132 @@ _MUTATING_SUBCOMMAND_ARGS = {
 # Flags de `find` que ejecutan comandos o escriben archivos.
 _FIND_EXEC_FLAGS = frozenset({
     "-exec", "-execdir", "-ok", "-okdir", "-delete",
-    "-fprint", "-fprint0", "-fls",
+    "-fprint", "-fprintf", "-fprint0", "-fls",
 })
 
 # Flags de `sed` que escriben en disco.
 _SED_WRITE_FLAGS = ("-i", "--in-place")
+
+# --- Vectores de ejecucion / mutacion a nivel de ARGUMENTO ------------------- #
+
+# Directorios de sistema confiables para invocaciones con ruta explicita. Un
+# binario homonimo fuera de ellos (./ls, /tmp/ls) no hereda la allowlist.
+TRUSTED_BIN_DIRS = frozenset({
+    "/bin", "/sbin", "/usr/bin", "/usr/sbin",
+    "/usr/local/bin", "/usr/local/sbin",
+})
+
+# awk y familia: el *programa* puede lanzar subprocesos con system() o tuberias.
+_AWK_BINARIES = frozenset({"awk", "gawk", "mawk", "nawk"})
+_AWK_EXEC_RE = re.compile(r"system\s*\(")
+# Tuberia de salida de awk hacia un comando: print ... | "cmd"  /  |& getline.
+_AWK_PIPE_RE = re.compile(r"\|&|\|")
+
+# GNU sed ejecuta comandos con el comando `e` y con el flag `e` de `s///`.
+_SED_EXEC_CMD_RE = re.compile(r"(?:^|[;\s}])(?:\d+(?:,\d+)?)?e(?:\s|$)")
+_SED_EXEC_FLAG_RE = re.compile(r"s(.).*?\1.*?\1[0-9gpImM]*e")
+
+# Flags cuyo VALOR es un programa/comando a ejecutar -> ejecucion arbitraria.
+_EXEC_ARG_FLAGS = {
+    "sort": ("--compress-program",),
+    "man": ("-P", "--pager"),
+    "awk": ("-f", "--file"),
+    "gawk": ("-f", "--file"),
+    "mawk": ("-f", "--file"),
+    "nawk": ("-f", "--file"),
+    "sed": ("-f", "--file"),
+}
+
+# Flags que mutan el sistema (matan procesos, escriben, cambian configuracion).
+_MUTATING_ARG_FLAGS = {
+    "date": ("-s", "--set"),
+    "dmesg": ("-c", "-C", "--clear", "-D", "--console-off", "-E", "--console-on"),
+    "fuser": ("-k", "-K", "--kill"),
+    "ss": ("-K", "--kill"),
+    "sort": ("-o", "--output"),
+    "git": ("-c", "--config-env", "--pager"),
+    "journalctl": ("--rotate", "--vacuum-time", "--vacuum-size", "--vacuum-files"),
+}
+
+# Palabras de mutacion que `ifconfig` acepta como argumentos posicionales.
+_IFCONFIG_MUTATING_WORDS = frozenset({
+    "up", "down", "netmask", "broadcast", "mtu", "arp", "-arp", "promisc",
+    "-promisc", "allmulti", "-allmulti", "txqueuelen", "add", "del", "hw",
+    "metric", "pointopoint", "tunnel",
+})
+
+# Flags de `hostname` que solo consultan (el resto de invocaciones con
+# argumento posicional renombran el equipo).
+_HOSTNAME_QUERY_FLAGS = frozenset({"-f", "--fqdn", "-d", "--domain", "-i", "--ip-address",
+                                   "-I", "--all-ip-addresses", "-s", "--short", "-a", "--alias"})
+
+
+def _matches_flag(args: Sequence[str], flags: Sequence[str]) -> Optional[str]:
+    """Devuelve el primer flag de ``flags`` presente en ``args``, o ``None``.
+
+    Acepta la forma exacta (``-c``) y la forma con valor adjunto
+    (``--output=x``, ``--compress-program=/bin/sh``).
+    """
+    for arg in args:
+        for flag in flags:
+            if arg == flag or (flag.startswith("--") and arg.startswith(flag + "=")):
+                return flag
+    return None
+
+
+def _awk_program_text(args: Sequence[str]) -> str:
+    """Extrae el texto de programa de una invocacion de awk.
+
+    Se omiten los flags y los valores de los que consumen argumento
+    (``-F``/``--field-separator``, ``-v``/``--assign``) para no confundir una
+    asignacion o un separador de campos con el programa.
+    """
+    program: List[str] = []
+    skip_next = False
+    value_flags = ("-F", "--field-separator", "-v", "--assign")
+    for arg in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg in value_flags:
+            skip_next = True
+            continue
+        if (arg.startswith("-F") or arg.startswith("-v")
+                or arg.startswith("--field-separator=") or arg.startswith("--assign=")
+                or arg.startswith("-")):
+            continue
+        program.append(arg)
+    return " ".join(program)
+
+
+def _awk_executes(args: Sequence[str]) -> bool:
+    """``True`` si el programa awk puede lanzar un subproceso."""
+    text = _awk_program_text(args)
+    return bool(_AWK_EXEC_RE.search(text) or _AWK_PIPE_RE.search(text))
+
+
+def _sed_executes(args: Sequence[str]) -> bool:
+    """``True`` si el script sed usa el comando `e` o el flag `e` de `s///`."""
+    scripts = [a for a in args if not a.startswith("-")]
+    return any(
+        _SED_EXEC_CMD_RE.search(s) or _SED_EXEC_FLAG_RE.search(s) for s in scripts
+    )
+
+
+def _ifconfig_mutates(args: Sequence[str]) -> bool:
+    """``True`` si la invocacion de ifconfig cambia la configuracion de red."""
+    if any(a in _IFCONFIG_MUTATING_WORDS for a in args):
+        return True
+    positionals = [a for a in args if not a.startswith("-")]
+    return len(positionals) >= 2
+
+
+def _hostname_mutates(args: Sequence[str]) -> bool:
+    """``True`` si la invocacion de hostname renombra el equipo."""
+    positionals = [a for a in args if not a.startswith("-")]
+    if positionals:
+        return True
+    return any(a not in _HOSTNAME_QUERY_FLAGS for a in args)
 
 
 class CommandPolicy:
@@ -188,6 +340,18 @@ class CommandPolicy:
         base = tokens[0]
         args = tokens[1:]
 
+        # Invocacion por ruta (/usr/bin/ls, ./ls, /tmp/ls). Solo se acepta si
+        # el binario vive en un directorio de sistema confiable: un homonimo
+        # bajo control del usuario no debe heredar la allowlist.
+        if "/" in base:
+            directory, _, name = base.rpartition("/")
+            if directory not in TRUSTED_BIN_DIRS:
+                return (
+                    cls.RISK_MEDIUM,
+                    "Binario invocado por ruta no confiable ('{}'): requiere confirmacion".format(base),
+                )
+            base = name
+
         if base in _PRIVILEGE_WRAPPERS:
             return (cls.RISK_HIGH, "Elevacion de privilegios ({}): requiere confirmacion".format(base))
         if base in _EXEC_WRAPPERS:
@@ -197,9 +361,39 @@ class CommandPolicy:
             return (cls.RISK_MEDIUM, "Comando no reconocido: requiere confirmacion")
 
         if base == "find" and any(a in _FIND_EXEC_FLAGS for a in args):
-            return (cls.RISK_HIGH, "find con -exec/-delete: requiere confirmacion")
+            return (cls.RISK_HIGH, "find con -exec/-delete/-fprintf: requiere confirmacion")
         if base == "sed" and any(a.startswith(_SED_WRITE_FLAGS) for a in args):
             return (cls.RISK_MEDIUM, "sed en modo edicion in-place: requiere confirmacion")
+
+        # --- Argumentos que lanzan subprocesos (ejecucion arbitraria) --------- #
+        exec_flag = _matches_flag(args, _EXEC_ARG_FLAGS.get(base, ()))
+        if exec_flag:
+            return (
+                cls.RISK_HIGH,
+                "Flag '{} {}' ejecuta un programa externo: requiere confirmacion".format(base, exec_flag),
+            )
+        if base in _AWK_BINARIES and _awk_executes(args):
+            return (
+                cls.RISK_HIGH,
+                "Programa awk con system()/tuberia a comando: requiere confirmacion",
+            )
+        if base == "sed" and _sed_executes(args):
+            return (
+                cls.RISK_HIGH,
+                "Script sed con comando 'e' (ejecuta comandos de shell): requiere confirmacion",
+            )
+
+        # --- Argumentos que mutan el estado del sistema ----------------------- #
+        mutating_flag = _matches_flag(args, _MUTATING_ARG_FLAGS.get(base, ()))
+        if mutating_flag:
+            return (
+                cls.RISK_MEDIUM,
+                "Flag mutante '{} {}' modifica el sistema: requiere confirmacion".format(base, mutating_flag),
+            )
+        if base == "ifconfig" and _ifconfig_mutates(args):
+            return (cls.RISK_MEDIUM, "ifconfig con parametros de escritura: requiere confirmacion")
+        if base == "hostname" and _hostname_mutates(args):
+            return (cls.RISK_MEDIUM, "hostname con nombre nuevo (renombra el equipo): requiere confirmacion")
 
         readonly = _READONLY_SUBCOMMANDS.get(base)
         if readonly is not None:

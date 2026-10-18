@@ -8,6 +8,11 @@ Regresion cubierta: la version anterior de ``HomeLab._is_safe_command`` usaba
 ``startswith`` sobre una allowlist, por lo que ``ls; rm -rf /`` se clasificaba
 como seguro y se saltaba la confirmacion en el servidor remoto.
 
+Segunda capa (2026-10-18): vectores de ejecucion/mutacion a nivel de
+*argumento* (``command rm -rf /``, ``awk 'BEGIN{system("id")}'``,
+``sed -n '1e whoami'``, ``sort --compress-program=``, ``man -P``, ``date -s``,
+``ifconfig eth0 down``...) y binarios invocados por ruta no confiable.
+
 Estas pruebas son stdlib + pytest y NO requieren dependencias pesadas
 (``paramiko``, ``ollama``, ``spacy``).
 """
@@ -48,6 +53,24 @@ SAFE_COMMANDS = [
     # Argumentos con metacaracteres ENTRE COMILLAS no son composicion de shell:
     'echo "a;b"',
     "echo 'rm -rf /'",
+    # Invocacion por ruta absoluta desde un directorio de sistema confiable:
+    "/usr/bin/ls -la",
+    "/bin/df -h",
+    "/usr/local/bin/awk -F: '{print $1}' /etc/passwd",
+    # Programas de solo lectura de binarios con vectores de ejecucion:
+    "awk -F: '{print $1}' /etc/passwd",
+    "awk '{print $2}' /var/log/syslog",
+    "sed -n '1,5p' /etc/hosts",
+    "sort /var/log/dpkg.log",
+    "date +%Y",
+    "hostname",
+    "hostname -f",
+    "ifconfig",
+    "ifconfig eth0",
+    "dmesg",
+    "fuser /tmp/x",
+    "ss -tulpn",
+    "man ls",
 ]
 
 # Comandos que la version vulnerable (startswith) marcaba como seguros.
@@ -67,6 +90,41 @@ BYPASS_COMMANDS = [
     "cd /tmp; rm -rf .",
     "dd if=/dev/zero of=/dev/sda",
     "echo a$b",
+    # Envoltorios builtin de shell: 'command <cmd>' ejecuta el comando.
+    "command rm -rf /",
+    "command shutdown -h now",
+    'eval "rm -rf /"',
+    "exec rm -rf /",
+    "builtin rm -rf /",
+    "nohup rm -rf /",
+    "setsid rm -rf /",
+    "stdbuf -o0 rm -rf /",
+    # Vectores de ejecucion dentro de binarios de lectura.
+    "awk 'BEGIN{system(\"id\")}'",
+    "awk 'BEGIN{print \"x\" | \"sh\"}'",
+    "awk 'BEGIN{\"id\" | getline out; print out}'",
+    "sed -n '1e whoami' /etc/hostname",
+    "sed 'e echo pwned' /etc/hostname",
+    "sed 's/x/y/e' /etc/hostname",
+    "sed -f /tmp/evil.sed /etc/hostname",
+    "awk -f /tmp/evil.awk /etc/passwd",
+    "sort --compress-program=/bin/sh /tmp/list",
+    'man -P "sh -c id" ls',
+    # Mutaciones via argumentos de binarios de lectura.
+    "sort -o /etc/cron.d/x /tmp/list",
+    "fuser -k /tmp/x",
+    "ss -K dst 10.0.0.1",
+    "date -s 2020-01-01",
+    "hostname evil",
+    "ifconfig eth0 down",
+    "ifconfig eth0 10.0.0.5/24",
+    "dmesg -c",
+    "git log -c core.pager=sh",
+    "find . -fprintf /tmp/x %p",
+    # Binarios invocados por ruta no confiable.
+    "/tmp/ls -la",
+    "./ls -la",
+    "/home/user/bin/ls -la",
 ]
 
 HIGH_RISK_WRAPPERS = [
@@ -78,6 +136,9 @@ HIGH_RISK_WRAPPERS = [
     "find . -exec rm {} +",
     "find / -delete",
     "sed -i s/foo/bar/ file.txt",
+    "timeout 5 rm -rf /tmp/x",
+    "chroot /mnt rm -rf /",
+    "watch ls",
 ]
 
 
@@ -228,6 +289,105 @@ def test_security_layer_keeps_dangerous_severity():
     assert _security_layer().classify_risk("rm -rf /")[0] == SecurityLayer.RISK_CRITICAL
 
 
+
+
+# --------------------------------------------------------------------------- #
+# Segunda capa: vectores de ejecucion/mutacion a nivel de ARGUMENTO
+# --------------------------------------------------------------------------- #
+EXEC_ARGUMENT_VECTORS = [
+    "command rm -rf /",
+    "command systemctl stop sshd",
+    'eval "rm -rf /"',
+    "exec rm -rf /",
+    "builtin rm -rf /",
+    "nohup rm -rf /",
+    "setsid rm -rf /",
+    "awk 'BEGIN{system(\"id\")}'",
+    "awk 'BEGIN{print \"x\" | \"sh\"}'",
+    "sed -n '1e whoami' /etc/hostname",
+    "sed 'e echo pwned' /etc/hostname",
+    "sed 's/x/y/e' /etc/hostname",
+    "sed -f /tmp/evil.sed /etc/hostname",
+    "awk -f /tmp/evil.awk /etc/passwd",
+    "sort --compress-program=/bin/sh /tmp/list",
+    'man -P "sh -c id" ls',
+]
+
+MUTATING_ARGUMENT_VECTORS = [
+    "sort -o /etc/cron.d/x /tmp/list",
+    "sort --output=/tmp/out /tmp/list",
+    "fuser -k /tmp/x",
+    "ss -K dst 10.0.0.1",
+    "date -s 2020-01-01",
+    "hostname evil",
+    "ifconfig eth0 down",
+    "ifconfig eth0 10.0.0.5/24",
+    "dmesg -c",
+    "git log -c core.pager=sh",
+]
+
+
+@pytest.mark.parametrize("command", EXEC_ARGUMENT_VECTORS)
+def test_arguments_that_spawn_subprocesses_are_high_risk(command):
+    """Un binario de la allowlist no puede ejecutar subprocesos por argumento."""
+    risk, reason = CommandPolicy.classify(command)
+    assert risk == CommandPolicy.RISK_HIGH, (command, risk, reason)
+    assert CommandPolicy.is_command_safe(command) is False
+    assert _homelab_without_init()._is_safe_command(command) is False
+    assert _security_layer().classify_risk(command)[0] != SecurityLayer.RISK_LOW
+
+
+@pytest.mark.parametrize("command", MUTATING_ARGUMENT_VECTORS)
+def test_arguments_that_mutate_the_system_require_confirmation(command):
+    risk, reason = CommandPolicy.classify(command)
+    assert risk == CommandPolicy.RISK_MEDIUM, (command, risk, reason)
+    assert CommandPolicy.is_command_safe(command) is False
+    assert _homelab_without_init()._is_safe_command(command) is False
+    assert _security_layer().classify_risk(command)[0] != SecurityLayer.RISK_LOW
+
+
+@pytest.mark.parametrize(
+    "command",
+    EXEC_ARGUMENT_VECTORS + MUTATING_ARGUMENT_VECTORS + [
+        "/tmp/ls -la",
+        "./ls -la",
+        "/opt/tools/git status",
+    ],
+)
+def test_every_degradation_explains_itself(command):
+    risk, reason = CommandPolicy.classify(command)
+    assert risk != CommandPolicy.RISK_LOW
+    assert reason and "confirmacion" in reason.lower()
+
+
+def test_shell_builtins_that_execute_are_not_allowlisted():
+    # 'command' ejecuta el comando siguiente: no puede ser un binario "seguro".
+    assert "command" not in CommandPolicy.SAFE_BINARIES
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["/tmp/ls -la", "./ls -la", "/home/user/bin/ls -la", "/opt/tools/git status",
+     "~/ls -la", "../ls"],
+)
+def test_path_invocations_outside_trusted_dirs_require_confirmation(command):
+    risk, reason = CommandPolicy.classify(command)
+    assert risk == CommandPolicy.RISK_MEDIUM, (command, risk, reason)
+    assert reason and "ruta no confiable" in reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["/usr/bin/ls -la", "/bin/df -h", "/usr/local/bin/git status", "/usr/bin/awk '{print $1}'"],
+)
+def test_path_invocations_inside_trusted_dirs_stay_low(command):
+    assert _risk(command) == CommandPolicy.RISK_LOW
+
+
+def test_truncated_path_never_grants_low_risk():
+    # Un homonimo colocado antes del binario real no debe pasar la puerta.
+    risk, _ = CommandPolicy.classify("/tmp/ls /bin/rm -rf /")
+    assert risk != CommandPolicy.RISK_LOW
 
 
 # --------------------------------------------------------------------------- #
