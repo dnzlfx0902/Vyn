@@ -1,6 +1,6 @@
 # VYN — Voice Your Needs
 
-[![CI](https://github.com/Chriss-devv/Vyn/actions/workflows/ci.yml/badge.svg)](https://github.com/Chriss-devv/Vyn/actions/workflows/ci.yml)
+[![CI](https://github.com/dnzlfx0902/Vyn/actions/workflows/ci.yml/badge.svg)](https://github.com/dnzlfx0902/Vyn/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![Local-first](https://img.shields.io/badge/inference-local%20(Ollama)-green)
 
@@ -51,7 +51,7 @@ ollama pull llama3.1:8b
 ## Instalación desde fuente
 
 ```bash
-git clone https://github.com/Chriss-devv/Vyn.git
+git clone https://github.com/dnzlfx0902/Vyn.git
 cd Vyn
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
